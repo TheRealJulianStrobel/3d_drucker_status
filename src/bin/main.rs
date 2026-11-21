@@ -9,10 +9,12 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use esp_hal::clock::CpuClock;
+use esp_hal::rmt;
+use esp_hal::{clock::CpuClock, peripherals::Peripherals};
 use esp_hal::timer::timg::TimerGroup;
 
 
+use esp_hal::gpio::Pin;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 
@@ -23,15 +25,20 @@ use panic_rtt_target as _;
 
 
 mod LED_Driver{
-    use esp_hal::riscv::register::Permission::R;
-use esp_hal::time::Rate;
-    use esp_hal::gpio::Level;
+    use defmt::info;
+    use libm::sinf;
+    use core::f32::consts::PI;
+    use embassy_time::{Duration, Timer};
+    use esp_hal::clock::CpuClock;
+    use esp_hal::time::Rate;
+    use esp_hal::gpio::{Level, AnyPin};
+    use esp_hal::peripherals::{RMT};
     use esp_hal::rmt::{PulseCode, Rmt, TxChannelConfig, TxChannelCreator, Channel};
     const MAX_LED_COUNT: usize = 255;
     const LED_0: PulseCode = PulseCode::new(Level::High, 4, Level::Low, 9);
     const LED_1: PulseCode = PulseCode::new(Level::High, 8, Level::Low, 5);
     const LED_RET: PulseCode = PulseCode::end_marker();
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct RGB {
         r: u8,
         g: u8,
@@ -56,45 +63,41 @@ use esp_hal::time::Rate;
     enum LED_Function{
         Static,
         Dimmed(u8),
-        Breathing(u8),
+        Breathing(f32),
         Off,
     }
 
-    struct LED_Driver{
+    pub struct LED_Driver<'a>{
         state: LED_Driver_State,
         function: LED_Function,
-        rmt: Rmt<'_, esp_hal::Blocking>,
         tx_config: TxChannelConfig,
-        channel: Channel<'_, esp_hal::Blocking, esp_hal::rmt::Tx>,
+        channel: Option<esp_hal::rmt::Channel<'a, esp_hal::Blocking, esp_hal::rmt::Tx>>,
         colors: [RGB; MAX_LED_COUNT],
         led_count: usize,
     }
 
-    impl LED_Driver{
-        pub fn new() -> Self{
+    impl<'a> LED_Driver<'a>{
+        pub fn new(led_pin: AnyPin<'a>, per_rmt: RMT<'a>) -> Self{
+            let rmt: Rmt<'_, esp_hal::Blocking>= Rmt::new(per_rmt, Rate::from_mhz(80)).unwrap();
+
+            let tx_config = TxChannelConfig::default().with_clk_divider(8);
+
+            let mut channel: esp_hal::rmt::Channel<'_, esp_hal::Blocking, esp_hal::rmt::Tx> = rmt
+                .channel0
+                .configure_tx(&tx_config).unwrap()
+                .with_pin(led_pin);
             LED_Driver{
-                state: LED_Driver_State::Created,
+                state: LED_Driver_State::Initialized,
                 function: LED_Function::Off,
-                channel: TxChannelConfig::default(),
+                tx_config: tx_config,
+                channel: Some(channel),
                 colors: [RGB{r:0,g:0,b:0}; MAX_LED_COUNT],
                 led_count: 0,
             }
         }
-        pub fn init(&mut self, rmt: Rmt<'_, esp_hal::Blocking>, led_pin: Peripherals){
-            match self.state{
-                LED_Driver_State::Created => {
-                    self.channel = rmt.create_tx_channel(led_pin).unwrap();
-                    self.state = LED_Driver_State::Initialized;
-                },
-                _ => {
-                    info!("LED Driver is not in Created state, cannot initialize");
-                    return;
-                }
-            }
-        }
 
-        pub fn set_color(&mut self, color: RGB){
-            self.color = color;
+        pub fn set_color(&mut self, color: RGB, led_index: usize){
+            self.colors[led_index] = color;
         }
 
         pub fn set_function(&mut self, function: LED_Function){
@@ -105,7 +108,7 @@ use esp_hal::time::Rate;
             self.function = LED_Function::Dimmed(dim_level);
         }
 
-        pub fn set_function_Breathing(&mut self, breath_freq: u8){
+        pub fn set_function_Breathing(&mut self, breath_freq: f32){
             self.function = LED_Function::Breathing(breath_freq);
         }
 
@@ -118,47 +121,120 @@ use esp_hal::time::Rate;
         }
 
         pub fn start(&mut self){
-            if self.state != LED_Driver_State::Initialized || self.state != LED_Driver_State::Stopped{
-                info!("LED Driver is not in Initialized or Stopped state, cannot start");
-                return;
+            match self.state{
+                LED_Driver_State::Created => {
+                    info!("LED Driver is in Created state, cannot start");
+                    return;
+                },
+                LED_Driver_State::Running => {
+                    info!("LED Driver is already running, cannot start");
+                    return;
+                },
+                _ => {self.state = LED_Driver_State::Running;}
             }
-            self.state = LED_Driver_State::Running;
         }
 
         pub fn stop(&mut self){
-            if self.state != LED_Driver_State::Running{
-                info!("LED Driver is not in Running state, cannot stop");
-                return;
+            match self.state{
+                LED_Driver_State::Created => {
+                    info!("LED Driver is in Created state, cannot stop");
+                    return;
+                },
+                LED_Driver_State::Stopped => {
+                    info!("LED Driver is already stopped, cannot stop");
+                    return;
+                },
+                _ => {
+                    self.state = LED_Driver_State::Stopped;
+                }
             }
-            self.state = LED_Driver_State::Stopped;
+        }
+        pub fn add_led(&mut self, color: RGB){
+            if self.led_count < MAX_LED_COUNT{
+                self.colors[self.led_count] = color;
+                self.led_count += 1;
+            }else{
+                info!("Maximum LED count reached, cannot add more LEDs");
+            }
         }
 
-        pub fn run(&mut self){
-            if self.state != LED_Driver_State::Running{
-                info!("LED Driver is not in Running state, cannot run");
-                return;
+        pub fn remove_led(&mut self, index: usize){
+            if index < self.led_count{
+                for i in index..self.led_count-1{
+                    self.colors[i] = self.colors[i+1];
+                }
+                self.colors[self.led_count-1] = RGB{r:0,g:0,b:0};
+                self.led_count -= 1;
+            }else{
+                info!("LED index out of bounds, cannot remove LED");
             }
-            let mut pulse_codes: [PulseCode; 24] = [LED_RET; 24];
-            match self.function{
-                LED_Function::Static => {
-                    let pulse_codes = rgb_to_pulsecode(&self.color);
-                    self.channel.transmit(&pulse_codes).unwrap();
-                },
-                LED_Function::Dimmed(dim_level) => {
-                    let dimmed_color = RGB{
-                        r: (self.color.r as f32 * (dim_level as f32 / 255.0)) as u8,
-                        g: (self.color.g as f32 * (dim_level as f32 / 255.0)) as u8,
-                        b: (self.color.b as f32 * (dim_level as f32 / 255.0)) as u8,
-                    };
-                    let pulse_codes = rgb_to_pulsecode(&dimmed_color);
-                    self.channel.transmit(&pulse_codes).unwrap();
-                },
-                LED_Function::Breathing(breath_freq) => {
-                },
-                LED_Function::Off => {
-                },
+        }
 
+        pub fn clear_leds(&mut self){
+            for i in 0..self.led_count{
+                self.colors[i] = RGB{r:0,g:0,b:0};
             }
+            self.led_count = 0;
+        }
+
+        pub async fn run(&mut self){
+            let mut time: f32 = 0.0;
+            let time_step: f32 = 0.01; // Adjust this value to control the speed of the breathing effect
+            let mut output_colors: [RGB; MAX_LED_COUNT] = [RGB { r: 0, g: 0, b: 0 }; MAX_LED_COUNT];
+            let mut pulse_codes: [PulseCode; MAX_LED_COUNT*24 +1] = [LED_0; MAX_LED_COUNT*24 +1];
+            loop{
+                match self.state{
+                    LED_Driver_State::Running => {
+                        match self.function{
+                            LED_Function::Static => {
+                                output_colors = self.colors;
+                            },
+                            LED_Function::Dimmed(dim_level) => {
+                            },
+                            LED_Function::Breathing(breath_freq) => {
+                                time = (time + time_step) % breath_freq;
+                                //info!("Breathing effect time: {}", time);
+                                Self::breathing_effect(&self.colors, &mut output_colors, time, breath_freq);
+                            },
+                            LED_Function::Off => {
+                                output_colors = [RGB { r: 0, g: 0, b: 0 }; MAX_LED_COUNT];
+                            },
+
+                        }
+                        Self::rgb_array_to_pulsecode(self,&output_colors, &mut pulse_codes);
+
+                        let channel = self.channel.take().unwrap();
+                        info!("Transmitting pulse codes for {} LEDs", self.led_count);
+                        info!("Pulse codes: {:?}", &pulse_codes[..self.led_count * 24 + 1]);
+                        //info!("Color values: {:?}", &output_colors[..self.led_count]);
+                        //info!("Original color values: {:?}", &self.colors[..self.led_count]);
+                        match channel.transmit(&pulse_codes[..self.led_count * 24 + 1]) {
+                            Ok(transaction) => {
+                                match transaction.wait() {
+                                    Ok(_channel) => {
+                                        self.channel = Some(_channel);
+                                        //info!("RMT transmission completed successfully");
+                                    }
+                                    Err(error) => {
+                                        info!("RMT transmission wait failed: {:?}", error);
+                                        self.channel = Some(error.1);
+                                    }
+                                }
+                            }
+                            Err((error, _channel)) => {
+                                info!("RMT transmission failed: {:?}", error);
+                                self.channel = Some(_channel);
+                            }
+                        }
+                        
+                    },
+                    _ => {
+                        info!("LED Driver is not running, cannot run"); 
+                    }
+                }
+            Timer::after(Duration::from_millis(10)).await;
+            }
+
         }
 
         fn rgb_to_pulsecode(rgb: &RGB) -> [PulseCode; 24] {
@@ -171,10 +247,10 @@ use esp_hal::time::Rate;
             pulse_codes
         }
 
-        fn rgb_array_to_pulsecode(rgb_array: &[RGB], data: &mut [PulseCode]) {
+        fn rgb_array_to_pulsecode(&mut self, rgb_array: &[RGB], data: &mut [PulseCode]) {
             let mut index = 0;
-            for rgb in rgb_array {
-                let pulse_codes = rgb_to_pulsecode(rgb);
+            for i in 0..self.led_count{
+                let pulse_codes = Self::rgb_to_pulsecode(&rgb_array[i]);
                 for pulse_code in &pulse_codes {
                     data[index] = *pulse_code;
                     index += 1;
@@ -187,6 +263,26 @@ use esp_hal::time::Rate;
             rgb.r = (rgb.r as f32 * factor).min(255.0) as u8;
             rgb.g = (rgb.g as f32 * factor).min(255.0) as u8;
             rgb.b = (rgb.b as f32 * factor).min(255.0) as u8;
+        }
+
+        fn breathing_effect(
+            original: &[RGB],
+            output: &mut [RGB],
+            time: f32,
+            speed: f32,
+        ) {
+            let wave = sinf(time / speed * 2.0 * PI);
+
+            let brightness = (wave + 1.0) * 0.5;
+
+            let min_brightness = 0.05;
+            let factor = min_brightness + brightness * (1.0 - min_brightness);
+
+            for (src, dst) in original.iter().zip(output.iter_mut()) {
+                dst.r = (src.r as f32 * factor) as u8;
+                dst.g = (src.g as f32 * factor) as u8;
+                dst.b = (src.b as f32 * factor) as u8;
+            }
         }
     }
 }
@@ -213,9 +309,18 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     info!("Embassy initialized!");
-
-
-    // TODO: Spawn some tasks
+    let gpio15 = peripherals.GPIO15.degrade();
+    let rmt: esp_hal::peripherals::RMT<'_> = peripherals.RMT;
+    let mut led_driver = LED_Driver::LED_Driver::new(gpio15, rmt);
+    for _ in 0..3 {
+        led_driver.add_led(LED_Driver::LED_RED);
+        led_driver.add_led(LED_Driver::LED_GREEN);
+        led_driver.add_led(LED_Driver::LED_BLUE);
+    }
+    led_driver.add_led(LED_Driver::LED_YELLOW);
+    led_driver.set_function_Breathing(2.0);
+    led_driver.start();
+    led_driver.run().await;
     let _ = spawner;
 
     loop {

@@ -22,7 +22,8 @@ panic-rtt-target = { version = "0.2.0", features = ["defmt"] }
 rtt-target       = { version = "0.6.2", features = ["defmt"] }
 
 critical-section = "1.2.0"
-static_cell      = "2.1.1"
+libm = "0.2.16"
+
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
